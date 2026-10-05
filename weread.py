@@ -1,15 +1,50 @@
 
 
 import argparse
-import json
 import logging
+import os
+import sys
+from urllib.parse import urlparse
 import time
 from notion_client import Client
 import requests
-from requests.utils import cookiejar_from_dict
 from http.cookies import SimpleCookie
 from datetime import datetime
-from bs4 import BeautifulSoup
+
+
+class SyncError(Exception):
+    """An actionable error that contains no credentials or response bodies."""
+
+
+class WereadSession(requests.Session):
+    def request(self, method, url, **kwargs):
+        if urlparse(url).scheme != "https" or urlparse(url).hostname not in {
+            "weread.qq.com", "i.weread.qq.com"
+        }:
+            raise SyncError("拒绝向非微信读书地址发送请求。")
+        kwargs.setdefault("timeout", (10, 30))
+        kwargs["allow_redirects"] = False
+        try:
+            response = super().request(method, url, **kwargs)
+        except requests.RequestException:
+            raise SyncError("微信读书网络请求失败，请稍后重试。") from None
+        if response.status_code in (401, 403):
+            raise SyncError("微信读书认证失败，请重新登录并更新 WEREAD_COOKIE。")
+        if not 200 <= response.status_code < 300:
+            raise SyncError(f"微信读书请求失败（HTTP {response.status_code}）。")
+        return response
+
+
+def weread_json(response):
+    try:
+        data = response.json()
+    except ValueError:
+        raise SyncError("微信读书返回非 JSON 数据，请检查 Cookie 是否过期。") from None
+    if not isinstance(data, dict):
+        raise SyncError("微信读书返回的数据格式异常。")
+    if data.get("errcode", 0) != 0:
+        raise SyncError("微信读书接口返回错误，请检查 Cookie 和访问权限。")
+    return data
 
 WEREAD_URL = "https://weread.qq.com/"
 WEREAD_NOTEBOOKS_URL = "https://i.weread.qq.com/user/notebooks"
@@ -22,14 +57,15 @@ WEREAD_BOOK_INFO = "https://i.weread.qq.com/book/info"
 
 def parse_cookie_string(cookie_string):
     cookie = SimpleCookie()
-    cookie.load(cookie_string)
-    cookies_dict = {}
-    cookiejar = None
+    try:
+        cookie.load(cookie_string)
+    except Exception:
+        raise SyncError("WEREAD_COOKIE 格式无效。") from None
+    cookiejar = requests.cookies.RequestsCookieJar()
     for key, morsel in cookie.items():
-        cookies_dict[key] = morsel.value
-        cookiejar = cookiejar_from_dict(
-            cookies_dict, cookiejar=None, overwrite=True
-        )
+        cookiejar.set(key, morsel.value, domain=".weread.qq.com", path="/", secure=True)
+    if not cookiejar:
+        raise SyncError("WEREAD_COOKIE 为空或格式无效。")
     return cookiejar
 
 
@@ -38,10 +74,10 @@ def get_bookmark_list(bookId):
     params = dict(bookId=bookId)
     r = session.get(WEREAD_BOOKMARKLIST_URL, params=params)
     if r.ok:
-        updated = r.json().get("updated")
+        updated = weread_json(r).get("updated", [])
         updated = sorted(updated, key=lambda x: (
-            x.get("chapterUid", 1), int(x.get("range").split("-")[0])))
-        return r.json()["updated"]
+            x.get("chapterUid", 1), int((x.get("range") or "0").split("-")[0])))
+        return updated
     return None
 
 
@@ -50,7 +86,7 @@ def get_read_info(bookId):
                   readingBookIndex=1, finishedDate=1)
     r = session.get(WEREAD_READ_INFO_URL, params=params)
     if r.ok:
-        return r.json()
+        return weread_json(r)
     return None
 
 
@@ -60,7 +96,7 @@ def get_bookinfo(bookId):
     r = session.get(WEREAD_BOOK_INFO, params=params)
     isbn = ""
     if r.ok:
-        data = r.json()
+        data = weread_json(r)
         isbn = data["isbn"]
     return isbn
 
@@ -69,7 +105,7 @@ def get_review_list(bookId):
     """获取笔记"""
     params = dict(bookId=bookId, listType=11, mine=1, syncKey=0)
     r = session.get(WEREAD_REVIEW_LIST_URL, params=params)
-    reviews = r.json().get("reviews")
+    reviews = weread_json(r).get("reviews", [])
     summary = list(filter(lambda x: x.get("review").get("type") == 4, reviews))
     reviews = list(filter(lambda x: x.get("review").get("type") == 1, reviews))
     reviews = list(map(lambda x: x.get("review"), reviews))
@@ -164,7 +200,7 @@ def get_callout(content, style, colorStyle, reviewId):
 
 
 def check(bookId):
-    """检查是否已经插入过 如果已经插入了就删除"""
+    """Collect previous page IDs; archive them only after replacement succeeds."""
     time.sleep(0.3)
     filter = {
         "property": "BookId",
@@ -172,10 +208,17 @@ def check(bookId):
             "equals": bookId
         }
     }
-    response = client.databases.query(database_id=database_id, filter=filter)
-    for result in response["results"]:
-        time.sleep(0.3)
-        client.blocks.delete(block_id=result["id"])
+    ids = []
+    cursor = None
+    while True:
+        query = {"data_source_id": data_source_id, "filter": filter}
+        if cursor:
+            query["start_cursor"] = cursor
+        response = client.data_sources.query(**query)
+        ids.extend(result["id"] for result in response["results"])
+        if not response.get("has_more"):
+            return ids
+        cursor = response["next_cursor"]
 
 
 def get_chapter_info(bookId):
@@ -186,8 +229,9 @@ def get_chapter_info(bookId):
         'teenmode': 0
     }
     r = session.post(WEREAD_CHAPTER_INFO, json=body)
-    if r.ok and "data" in r.json() and len(r.json()["data"]) == 1 and "updated" in r.json()["data"][0]:
-        update = r.json()["data"][0]["updated"]
+    data = weread_json(r)
+    if "data" in data and len(data["data"]) == 1 and "updated" in data["data"][0]:
+        update = data["data"][0]["updated"]
         return {item["chapterUid"]: item for item in update}
     return None
 
@@ -196,8 +240,8 @@ def insert_to_notion(bookName, bookId, cover, sort, author):
     """插入到notion"""
     time.sleep(0.3)
     parent = {
-        "database_id": database_id,
-        "type": "database_id"
+        "data_source_id": data_source_id,
+        "type": "data_source_id"
     }
     properties = {
         "BookName": {"title": [{"type": "text", "text": {"content": bookName}}]},
@@ -240,10 +284,10 @@ def insert_to_notion(bookName, bookId, cover, sort, author):
 
 def add_children(id, children):
     results = []
-    for i in range(0, len(children)//100+1):
+    for i in range(0, len(children), 100):
         time.sleep(0.3)
         response = client.blocks.children.append(
-            block_id=id, children=children[i*100:(i+1)*100])
+            block_id=id, children=children[i:i+100])
         results.extend(response.get("results"))
     return results if len(results) == len(children) else None
 
@@ -259,12 +303,14 @@ def get_notebooklist():
     """获取笔记本列表"""
     r = session.get(WEREAD_NOTEBOOKS_URL)
     if r.ok:
-        data = r.json()
+        data = weread_json(r)
         books = data.get("books")
+        if not isinstance(books, list):
+            raise SyncError("微信读书书架数据缺失，请检查 Cookie 是否有效。")
         books.sort(key=lambda x: x["sort"])
         return books
     else:
-        print(r.text)
+        raise SyncError("微信读书书架请求失败。")
     return None
 
 
@@ -282,8 +328,8 @@ def get_sort():
             "direction": "descending",
         }
     ]
-    response = client.databases.query(
-        database_id=database_id, filter=filter, sorts=sorts, page_size=1)
+    response = client.data_sources.query(
+        data_source_id=data_source_id, filter=filter, sorts=sorts, page_size=1)
     if (len(response.get("results")) == 1):
         return response.get("results")[0].get("properties").get("Sort").get("number")
     return 0
@@ -308,7 +354,7 @@ def get_children(chapter, summary, bookmark_list):
                     chapter.get(key).get("level"), chapter.get(key).get("title")))
             for i in value:
                 callout = get_callout(
-                    i.get("markText"), data.get("style"), i.get("colorStyle"), i.get("reviewId"))
+                    i.get("markText"), i.get("style"), i.get("colorStyle"), i.get("reviewId"))
                 children.append(callout)
                 if i.get("abstract") != None and i.get("abstract") != "":
                     quote = get_quote(i.get("abstract"))
@@ -327,24 +373,41 @@ def get_children(chapter, summary, bookmark_list):
     return children, grandchild
 
 
-if __name__ == "__main__":
+def main():
+    global session, client, database_id, data_source_id
     parser = argparse.ArgumentParser()
-    parser.add_argument("weread_cookie")
-    parser.add_argument("notion_token")
-    parser.add_argument("database_id")
+    parser.add_argument("--check", action="store_true", help="仅检查认证和数据库，不写入")
     options = parser.parse_args()
-    weread_cookie = options.weread_cookie
-    database_id = options.database_id
-    notion_token = options.notion_token
-    session = requests.Session()
+    names = ("WEREAD_COOKIE", "NOTION_TOKEN", "NOTION_DATABASE_ID")
+    values = {name: os.environ.get(name, "").strip() for name in names}
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        raise SyncError("缺少环境变量：" + ", ".join(missing))
+    weread_cookie = values["WEREAD_COOKIE"]
+    database_id = values["NOTION_DATABASE_ID"]
+    notion_token = values["NOTION_TOKEN"]
+    session = WereadSession()
     session.cookies = parse_cookie_string(weread_cookie)
     client = Client(
         auth=notion_token,
-        log_level=logging.ERROR
+        log_level=logging.ERROR, notion_version="2025-09-03", timeout_ms=30000
     )
     session.get(WEREAD_URL)
+    database = client.databases.retrieve(database_id=database_id)
+    sources = database.get("data_sources", [])
+    data_source_id = os.environ.get("NOTION_DATA_SOURCE_ID", "").strip()
+    if data_source_id:
+        if data_source_id.replace("-", "") not in {s["id"].replace("-", "") for s in sources}:
+            raise SyncError("NOTION_DATA_SOURCE_ID 不属于指定数据库。")
+    elif len(sources) == 1:
+        data_source_id = sources[0]["id"]
+    else:
+        raise SyncError("数据库包含零个或多个数据源，请设置 NOTION_DATA_SOURCE_ID。")
     latest_sort = get_sort()
     books = get_notebooklist()
+    if options.check:
+        print(f"认证及数据库检查通过，微信读书书架有 {len(books)} 本书；未写入数据。")
+        return
     if (books != None):
         for book in books:
             sort = book["sort"]
@@ -355,7 +418,7 @@ if __name__ == "__main__":
             cover = book.get("cover")
             bookId = book.get("bookId")
             author = book.get("author")
-            check(bookId)
+            previous_ids = check(bookId)
             chapter = get_chapter_info(bookId)
             bookmark_list = get_bookmark_list(bookId)
             summary, reviews = get_review_list(bookId)
@@ -365,6 +428,27 @@ if __name__ == "__main__":
             children, grandchild = get_children(
                 chapter, summary, bookmark_list)
             id = insert_to_notion(title, bookId, cover, sort, author)
-            results = add_children(id, children)
-            if(len(grandchild)>0 and results!=None):
-                add_grandchild(grandchild, results)
+            try:
+                results = add_children(id, children)
+                if results is None:
+                    raise SyncError("Notion 返回的块数量不完整。")
+                if grandchild:
+                    add_grandchild(grandchild, results)
+            except Exception:
+                # Keep old pages and remove the incomplete replacement from the cursor.
+                client.pages.update(page_id=id, archived=True)
+                raise
+            for previous_id in previous_ids:
+                client.pages.update(page_id=previous_id, archived=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SyncError as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(1)
+    except Exception:
+        print("同步失败：请检查 Notion 集成授权、数据库字段及网络；凭据与响应内容未输出。", file=sys.stderr)
+        sys.exit(1)
+
